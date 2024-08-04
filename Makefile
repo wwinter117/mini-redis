@@ -1,7 +1,10 @@
+CC = gcc
+CFLAGS = -Wall -W -pedantic -std=c99 -g
+
 all: mini-redis-server
 
 mini-redis-server: main.c
-	$(CC) -o mini-redis-server main.c -Wall -W -pedantic -std=c99
+	$(CC) $(CFLAGS) -o mini-redis-server main.c
 
 clean:
-	rm mini-redis-server
+	rm -f mini-redis-server
