@@ -1,2 +1,2 @@
-# cute-redis
+# mini-redis
 简易版本的redis
