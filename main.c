@@ -29,6 +29,11 @@ typedef struct redisdb {
 } redisdb;
 
 typedef struct redisserver {
+    int connected;
+
+    int userdb; // 1 - use rdb; 0 - not use rdb
+    int appendonly; // 1 - use aof; 0 - not use aof
+
     int server_fd;
     int new_socket;
 
@@ -225,6 +230,30 @@ send2Client(char *response, int flag) {
     send(rs.new_socket, res, strlen(res), 0);
 }
 
+
+/* ======================= CMD ======================= */
+void cmd_set(int argc, char *argv[]);
+
+void cmd_get(int argc, char *argv[]);
+
+void cmd_exp(int argc, char *argv[]);
+
+void cmd_ttl(int argc, char *argv[]);
+
+void cmd_save(int argc, char *argv[]);
+
+static struct {
+    char *name;
+
+    void (*func)(int argc, char *argv[]);
+} cmds[] = {
+        {"SET",    cmd_set},
+        {"GET",    cmd_get},
+        {"EXPIRE", cmd_exp},
+        {"TTL",    cmd_ttl},
+        {"SAVE",   cmd_save},
+};
+
 /* ======================= REdis Serialization Protocol process ======================= */
 
 /*
@@ -275,51 +304,14 @@ handle_command(char *command) {
     }
     printf("\n");
 
-    char *cmd = argv[0];
-    if (strcmp(cmd, "SET") == 0) {
-        if (argc < 3) {
-            send2Client("Usage: set 'key' 'value'", 0);
+    for (int j = 0; j < sizeof(cmds) / sizeof(cmds[0]); ++j) {
+        if (strcmp(argv[0], cmds[j].name) == 0) {
+            cmds[j].func(argc, argv);
             return;
         }
-        put(cur_ht, argv[1], argv[2]);
-        send2Client("OK", 1);
-    } else if (strcmp(cmd, "GET") == 0) {
-        if (argc != 2) {
-            send2Client("Usage: get 'key'", 0);
-            return;
-        }
-        char *value = get(cur_ht, argv[1]);
-        if (value) {
-            send2Client(value, 1);
-        } else {
-            send2Client("NULL", 0);
-        }
-    } else if (strcmp(cmd, "EXPIRE") == 0) {
-        if (argc < 3) {
-            send2Client("Usage: EXPIRE 'key' 'time'", 0);
-            return;
-        }
-        if (expire(argv[1], argv[2])) {
-            send2Client("OK", 1);
-        } else {
-            send2Client("key not exits", 0);
-        }
-    } else if (strcmp(cmd, "TTL") == 0) {
-        if (argc != 2) {
-            send2Client("Usage: TTL 'key'", 0);
-            return;
-        }
-        char *value = get(cur_expht, argv[1]);
-        if (value) {
-            send2Client(value, 1);
-        } else {
-            send2Client("NULL", 0);
-        }
-    } else {
-        send2Client("unknown command", 0);
     }
+    send2Client("not suport", 0);
 }
-
 
 /* ======================= Pre work ======================= */
 
@@ -335,6 +327,9 @@ serverinit(void) {
     cur_rdb = 0;
     cur_ht = rs.rdb[cur_rdb].ht;
     cur_expht = rs.rdb[cur_rdb].exp;
+    rs.connected = 0;
+    rs.userdb = 1;
+    rs.appendonly = 0;
 }
 
 /*
@@ -370,9 +365,88 @@ waitingForConne(void) {
         perror("accept");
         exit(EXIT_FAILURE);
     }
+    rs.connected = 1;
     printf("[Mini-Redis] Connection established\n");
 }
 
+void
+processFileEvents(void) {
+    // connected and handle every cmd
+    char buffer[BUFFER_SIZE] = {0};
+    memset(buffer, 0, BUFFER_SIZE);
+    int valread = (int) read(rs.new_socket, buffer, BUFFER_SIZE);
+    if (valread <= 0) {
+        printf("[Mini-Redis] Connection closed\n");
+        close(rs.new_socket);
+        rs.connected = 0;
+        return;
+    }
+    handle_command(buffer);
+}
+
+void
+processTimeEvents(void) {
+
+}
+
+void
+flushAppendOnlyFile(void) {
+
+}
+
+
+/* ======================= implimentations ======================= */
+
+void cmd_set(int argc, char *argv[]) {
+    if (argc < 3) {
+        send2Client("Usage: set 'key' 'value'", 0);
+        return;
+    }
+    put(cur_ht, argv[1], argv[2]);
+    send2Client("OK", 1);
+}
+
+void cmd_get(int argc, char *argv[]) {
+    if (argc != 2) {
+        send2Client("Usage: get 'key'", 0);
+        return;
+    }
+    char *value = get(cur_ht, argv[1]);
+    if (value) {
+        send2Client(value, 1);
+    } else {
+        send2Client("NULL", 0);
+    }
+}
+
+void cmd_exp(int argc, char *argv[]) {
+    if (argc < 3) {
+        send2Client("Usage: EXPIRE 'key' 'time'", 0);
+        return;
+    }
+    if (expire(argv[1], argv[2])) {
+        send2Client("OK", 1);
+    } else {
+        send2Client("key not exits", 0);
+    }
+}
+
+void cmd_ttl(int argc, char *argv[]) {
+    if (argc != 2) {
+        send2Client("Usage: TTL 'key'", 0);
+        return;
+    }
+    char *value = get(cur_expht, argv[1]);
+    if (value) {
+        send2Client(value, 1);
+    } else {
+        send2Client("NULL", 0);
+    }
+}
+
+void cmd_save(int argc, char *argv[]) {
+
+}
 
 int
 main(int argc, char *argv[]) {
@@ -390,17 +464,10 @@ main(int argc, char *argv[]) {
         // stop here for watting connetion...
         waitingForConne();
 
-        // connected and handle every cmd
-        char buffer[BUFFER_SIZE] = {0};
-        while (1) {
-            memset(buffer, 0, BUFFER_SIZE);
-            int valread = (int) read(rs.new_socket, buffer, BUFFER_SIZE);
-            if (valread <= 0) {
-                printf("[Mini-Redis] Connection closed\n");
-                close(rs.new_socket);
-                break;
-            }
-            handle_command(buffer);
+        while (rs.connected) {
+            processFileEvents();
+            processTimeEvents();
+            flushAppendOnlyFile();
         }
     }
     free_server();
