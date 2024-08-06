@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 
 #define TABLE_SIZE 16
 #define MAX_RDB_NUM 8
@@ -20,7 +21,6 @@ typedef struct entry {
 typedef struct hashtable {
     entry *entry[TABLE_SIZE];
     unsigned long size;
-    unsigned long used;
 } hashtable;
 
 typedef struct redisdb {
@@ -32,7 +32,8 @@ typedef struct redisserver {
     int connected;
 
     int userdb; // 1 - use rdb; 0 - not use rdb
-    int appendonly; // 1 - use aof; 0 - not use aof
+    int rdb_fd;
+    char *rdb_name;
 
     int server_fd;
     int new_socket;
@@ -42,6 +43,12 @@ typedef struct redisserver {
 
     redisdb rdb[MAX_RDB_NUM];
 } redisserver;
+
+typedef struct rdbfile {
+    char head[6];
+    char version[3];
+
+} rdbfile;
 
 redisserver rs;
 int cur_rdb;
@@ -103,7 +110,6 @@ createHt(void) {
         ht->entry[j] = NULL;
     }
     ht->size = 0;
-    ht->used = 0;
     return ht;
 }
 
@@ -136,9 +142,9 @@ free_server(void) {
 
 /* ======================= For debug ======================= */
 void
-printht(void) {
+printht(hashtable *ht) {
     for (int i = 0; i < TABLE_SIZE; ++i) {
-        entry *e = cur_ht->entry[i];
+        entry *e = ht->entry[i];
         if (e) {
             printf("%d\t: ", i);
             while (e) {
@@ -163,6 +169,7 @@ put(hashtable *ht, const char *key, const char *value) {
     entry *e = ht->entry[slot];
     if (e == NULL) {
         ht->entry[slot] = createEntry(key, value);
+        ht->size++;
         return;
     }
 
@@ -175,12 +182,14 @@ put(hashtable *ht, const char *key, const char *value) {
                 exit(EXIT_FAILURE);
             }
             strcpy(e->value, value);
+            ht->size++;
             return;
         }
         pre = e;
         e = e->next;
     }
     pre->next = createEntry(key, value);
+    ht->size++;
 }
 
 char *
@@ -291,10 +300,10 @@ handle_command(char *command) {
         return;
     }
 
-    if (argc < 2) {
-        send2Client("empty command", 0);
-        return;
-    }
+//    if (argc < 2) {
+//        send2Client("empty command", 0);
+//        return;
+//    }
 
     char **p = argv;
     printf("*Recived cmd:");
@@ -314,6 +323,12 @@ handle_command(char *command) {
 }
 
 /* ======================= Pre work ======================= */
+void recoverRdb(char *rdb_name) {
+//    if ((rs.rdb_fd = open(rdb_name, O_RDONLY | O_WRONLY)) == -1) {
+//        perror("Unable to open rdb file for writing");
+//        exit(EXIT_FAILURE);
+//    }
+}
 
 /*
  * initail rdb hastable and rdb expire hashtable
@@ -329,7 +344,8 @@ serverinit(void) {
     cur_expht = rs.rdb[cur_rdb].exp;
     rs.connected = 0;
     rs.userdb = 1;
-    rs.appendonly = 0;
+    rs.rdb_name = "dump.rdb";
+    recoverRdb(rs.rdb_name);
 }
 
 /*
@@ -444,8 +460,56 @@ void cmd_ttl(int argc, char *argv[]) {
     }
 }
 
-void cmd_save(int argc, char *argv[]) {
+void saveStrPair(entry *e) {
+    char *k = e->key;
+    char *v = e->value;
+    size_t buf_size = strlen(k) + strlen(v) + 16;
+    char *buf = malloc(buf_size);
+    snprintf(buf, buf_size, "STRING%d%s%d%s", (int) strlen(k), k, (int) strlen(v), v);
+    printf("buf: %s\n", buf);
+    if ((write(rs.rdb_fd, buf, buf_size)) != (int) buf_size) {
+        send2Client("Save failed", 0);
+        close(rs.rdb_fd);
+    }
+    free(buf);
+}
 
+void cmd_save(int argc, char *argv[]) {
+    if ((rs.rdb_fd = open(rs.rdb_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)) == -1) {
+        perror("Unable to open rdb file for writing");
+        exit(EXIT_FAILURE);
+    }
+
+    if (argc != 1 || strcmp(argv[0], "SAVE") != 0) {
+        send2Client("Usage: SAVE", 0);
+    }
+    char h_buf[] = "REDIS";
+    if ((write(rs.rdb_fd, h_buf, sizeof(h_buf)) != sizeof(h_buf))) {
+        send2Client("Save failed", 0);
+        close(rs.rdb_fd);
+        return;
+    }
+    // 遍历所有数据库，保存已有数据
+    for (int i = 0; i < MAX_RDB_NUM; ++i) {
+        char db_buf[16] = {0};
+        snprintf(db_buf, sizeof(db_buf), "SELECTDB%d", i);
+        if ((write(rs.rdb_fd, db_buf, sizeof(db_buf)) != sizeof(db_buf))) {
+            send2Client("Save failed", 0);
+            close(rs.rdb_fd);
+            return;
+        }
+        hashtable *ht = rs.rdb[i].ht;
+        printht(ht);
+        for (int j = 0; j < TABLE_SIZE; ++j) {
+            entry *e = ht->entry[j];
+            while (e) {
+                printf("hi %d\n", j);
+                saveStrPair(e);
+                e = e->next;
+            }
+        }
+    }
+    send2Client("OK", 1);
 }
 
 int
