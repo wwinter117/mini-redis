@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #define TABLE_SIZE 16
 #define MAX_RDB_NUM 8
@@ -465,10 +466,10 @@ void saveStrPair(entry *e) {
     char *v = e->value;
     size_t buf_size = strlen(k) + strlen(v) + 16;
     char *buf = malloc(buf_size);
-    snprintf(buf, buf_size, "STRING%d%s%d%s", (int) strlen(k), k, (int) strlen(v), v);
+    snprintf(buf, buf_size, "STR%d%s%d%s", (int) strlen(k), k, (int) strlen(v), v);
     printf("buf: %s\n", buf);
-    if ((write(rs.rdb_fd, buf, buf_size)) != (int) buf_size) {
-        send2Client("Save failed", 0);
+    if ((write(rs.rdb_fd, buf, strlen(buf))) != strlen(buf)) {
+        send2Client("Save failed: entry", 0);
         close(rs.rdb_fd);
     }
     free(buf);
@@ -483,18 +484,18 @@ void cmd_save(int argc, char *argv[]) {
     if (argc != 1 || strcmp(argv[0], "SAVE") != 0) {
         send2Client("Usage: SAVE", 0);
     }
-    char h_buf[] = "REDIS";
-    if ((write(rs.rdb_fd, h_buf, sizeof(h_buf)) != sizeof(h_buf))) {
-        send2Client("Save failed", 0);
+    char h_buf[10] = "REDIS1.0.0";
+    if ((write(rs.rdb_fd, h_buf, 10) != sizeof(h_buf))) {
+        send2Client("Save failed: REDIS-version", 0);
         close(rs.rdb_fd);
         return;
     }
     // 遍历所有数据库，保存已有数据
     for (int i = 0; i < MAX_RDB_NUM; ++i) {
         char db_buf[16] = {0};
-        snprintf(db_buf, sizeof(db_buf), "SELECTDB%d", i);
-        if ((write(rs.rdb_fd, db_buf, sizeof(db_buf)) != sizeof(db_buf))) {
-            send2Client("Save failed", 0);
+        snprintf(db_buf, sizeof(db_buf), "DB%d", i);
+        if ((write(rs.rdb_fd, db_buf, strlen(db_buf)) != strlen(db_buf))) {
+            send2Client("Save failed: DB", 0);
             close(rs.rdb_fd);
             return;
         }
@@ -509,6 +510,7 @@ void cmd_save(int argc, char *argv[]) {
             }
         }
     }
+    close(rs.rdb_fd);
     send2Client("OK", 1);
 }
 
