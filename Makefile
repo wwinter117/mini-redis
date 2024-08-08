@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -W -pedantic -std=c99 -g
+CFLAGS = -Wall -W -pedantic -std=c99
 
 all: mini-redis-server
 
