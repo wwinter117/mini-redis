@@ -227,15 +227,18 @@ activeexpirecicle(void) {
 /*
  * flag 0 - response error
  * flag 1 - response sucsess
+ * flag 2 - response string data
  * for simple string response
  */
 void
 send2Client(char *response, int flag) {
     char res[BUFFER_SIZE];
     if (flag == 0) {
-        snprintf(res, BUFFER_SIZE, "- %s\r\n", response);
+        snprintf(res, BUFFER_SIZE, "-%s\r\n", response);
+    } else if (flag == 1) {
+        snprintf(res, BUFFER_SIZE, "+%s\r\n", response);
     } else {
-        snprintf(res, BUFFER_SIZE, "+ %s\r\n", response);
+        snprintf(res, BUFFER_SIZE, "$%lu\r\n%s\r\n", strlen(response), response);
     }
     send(rs.new_socket, res, strlen(res), 0);
 }
@@ -430,7 +433,7 @@ void cmd_get(int argc, char *argv[]) {
     }
     char *value = get(cur_ht, argv[1]);
     if (value) {
-        send2Client(value, 1);
+        send2Client(value, 2);
     } else {
         send2Client("NULL", 0);
     }
