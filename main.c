@@ -45,12 +45,6 @@ typedef struct redisserver {
     redisdb rdb[MAX_RDB_NUM];
 } redisserver;
 
-typedef struct rdbfile {
-    char head[6];
-    char version[3];
-
-} rdbfile;
-
 redisserver rs;
 int cur_rdb;
 hashtable *cur_ht;
@@ -75,20 +69,12 @@ hash(const char *key) {
 entry *
 createEntry(const char *key, const char *value) {
     entry *e = malloc(sizeof(entry));
-    if (e == NULL) {
-        perror("entry malloc");
+    if (!e) {
+        perror("malloc failed for entry");
         exit(EXIT_FAILURE);
     }
-    if ((e->key = malloc(strlen(key) + 1)) == NULL) {
-        perror("key malloc");
-        exit(EXIT_FAILURE);
-    }
-    if ((e->value = malloc(strlen(value) + 1)) == NULL) {
-        perror("value malloc");
-        exit(EXIT_FAILURE);
-    }
-    strcpy(e->key, key);
-    strcpy(e->value, value);
+    e->key = strdup(key);
+    e->value = strdup(value);
     e->next = NULL;
     return e;
 }
@@ -103,13 +89,11 @@ freeEntry(entry *e) {
 hashtable *
 createHt(void) {
     hashtable *ht = malloc(sizeof(hashtable));
-    if (ht == NULL) {
-        perror("cur_ht malloc");
+    if (!ht) {
+        perror("malloc failed for hashtable");
         exit(EXIT_FAILURE);
     }
-    for (int j = 0; j < TABLE_SIZE; ++j) {
-        ht->entry[j] = NULL;
-    }
+    memset(ht->entry, 0, sizeof(ht->entry));
     ht->size = 0;
     return ht;
 }
@@ -120,8 +104,8 @@ freeHt(hashtable *ht) {
         entry *e = ht->entry[i];
         while (e) {
             entry *t = e;
-            freeEntry(t);
             e = e->next;
+            freeEntry(t);
         }
     }
     free(ht);
@@ -130,16 +114,11 @@ freeHt(hashtable *ht) {
 void
 free_server(void) {
     for (int i = 0; i < MAX_RDB_NUM; ++i) {
-        hashtable *ht = rs.rdb[i].ht;
-        hashtable *expht = rs.rdb[i].exp;
-        if (ht) {
-            freeHt(ht);
-        }
-        if (expht) {
-            freeHt(expht);
-        }
+        freeHt(rs.rdb[i].ht);
+        freeHt(rs.rdb[i].exp);
     }
 }
+
 
 /* ======================= For debug ======================= */
 void
@@ -178,12 +157,7 @@ put(hashtable *ht, const char *key, const char *value) {
     while (e) {
         if (strcmp(e->key, key) == 0) {
             free(e->value);
-            if ((e->value = malloc(strlen(value) + 1)) == NULL) {
-                perror("value malloc");
-                exit(EXIT_FAILURE);
-            }
-            strcpy(e->value, value);
-            ht->size++;
+            e->value = strdup(value);
             return;
         }
         pre = e;
@@ -255,6 +229,8 @@ void cmd_ttl(int argc, char *argv[]);
 
 void cmd_save(int argc, char *argv[]);
 
+void cmd_select(int argc, char *argv[]);
+
 static struct {
     char *name;
 
@@ -265,6 +241,7 @@ static struct {
         {"EXPIRE", cmd_exp},
         {"TTL",    cmd_ttl},
         {"SAVE",   cmd_save},
+        {"SELECT", cmd_save},
 };
 
 /* ======================= REdis Serialization Protocol process ======================= */
@@ -304,11 +281,6 @@ handle_command(char *command) {
         return;
     }
 
-//    if (argc < 2) {
-//        send2Client("empty command", 0);
-//        return;
-//    }
-
     char **p = argv;
     printf("*Recived cmd:");
     while (*p) {
@@ -317,7 +289,8 @@ handle_command(char *command) {
     }
     printf("\n");
 
-    for (int j = 0; j < sizeof(cmds) / sizeof(cmds[0]); ++j) {
+    int num = sizeof(cmds) / sizeof(cmds[0]);
+    for (int j = 0; j < num; ++j) {
         if (strcmp(argv[0], cmds[j].name) == 0) {
             cmds[j].func(argc, argv);
             return;
@@ -327,11 +300,73 @@ handle_command(char *command) {
 }
 
 /* ======================= Pre work ======================= */
-void recoverRdb(char *rdb_name) {
-//    if ((rs.rdb_fd = open(rdb_name, O_RDONLY | O_WRONLY)) == -1) {
-//        perror("Unable to open rdb file for writing");
-//        exit(EXIT_FAILURE);
-//    }
+
+/*
+ * 解析数据库和键值对
+ */
+int parseRdbContent(const unsigned char *data, size_t size) {
+    size_t offset = 10;  // Skip "REDIS" and version
+    printf("[Mini-Redis] start recovery\n");
+
+    while (offset < size) {
+        if (strncmp((const char *) (data + offset), "DB", 2) == 0) {
+            cur_rdb = data[offset + 2] - '0';
+            printf("[Mini-Redis] found database: %d\n", cur_rdb);
+            offset += 3;
+        } else {
+            int key_len = data[offset++] - '0';
+            char *key = strndup((const char *) (data + offset), key_len);
+            offset += key_len;
+
+            int value_len = data[offset++] - '0';
+            char *value = strndup((const char *) (data + offset), value_len);
+            offset += value_len;
+
+            printf("found: %s-%s\n", key, value);
+            put(cur_ht, key, value);
+            free(key);
+            free(value);
+        }
+    }
+    printf("[Mini-Redis] done\n");
+    return 1;
+}
+
+void recoverRdb(void) {
+    FILE *file = fopen(rs.rdb_name, "rb");
+    if (!file) {
+        fprintf(stderr, "Failed to open rdb file\n");
+        return;
+    }
+    // 文件大小
+    fseek(file, 0, SEEK_END);
+    size_t size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    // 读取文件内容
+    unsigned char *data = malloc(size);
+    if (!data) {
+        fclose(file);
+        fprintf(stderr, "Failed to allocate memory\n");
+        return;
+    }
+
+    fread(data, 1, size, file);
+    fclose(file);
+
+    // 解析 RDB 文件头
+    if (strncmp((const char *) data, "REDIS", 5) != 0) {
+        fprintf(stderr, "Not a valid Redis RDB file.\n");
+        free(data);
+        return;
+    }
+    char version[6] = {0};
+    strncpy(version, (const char *) (data + 5), 5); // 提取版本号
+    printf("[Mini-Redis] RDB Version: %s\n", version);
+
+    // 解析 RDB 键值对
+    parseRdbContent(data, size);
+    free(data);
 }
 
 /*
@@ -349,7 +384,7 @@ serverinit(void) {
     rs.connected = 0;
     rs.userdb = 1;
     rs.rdb_name = "dump.rdb";
-    recoverRdb(rs.rdb_name);
+    recoverRdb();
 }
 
 /*
@@ -389,6 +424,9 @@ waitingForConne(void) {
     printf("[Mini-Redis] Connection established\n");
 }
 
+/*
+ * 阻塞io
+ */
 void
 processFileEvents(void) {
     // connected and handle every cmd
@@ -418,7 +456,7 @@ flushAppendOnlyFile(void) {
 /* ======================= implimentations ======================= */
 
 void cmd_set(int argc, char *argv[]) {
-    if (argc < 3) {
+    if (argc != 3) {
         send2Client("Usage: set 'key' 'value'", 0);
         return;
     }
@@ -469,9 +507,10 @@ void saveStrPair(entry *e) {
     char *v = e->value;
     size_t buf_size = strlen(k) + strlen(v) + 16;
     char *buf = malloc(buf_size);
-    snprintf(buf, buf_size, "STR%d%s%d%s", (int) strlen(k), k, (int) strlen(v), v);
+    snprintf(buf, buf_size, "%d%s%d%s", (int) strlen(k), k, (int) strlen(v), v);
     printf("buf: %s\n", buf);
-    if ((write(rs.rdb_fd, buf, strlen(buf))) != strlen(buf)) {
+    ssize_t len = (ssize_t) strlen(buf);
+    if ((write(rs.rdb_fd, buf, len)) != len) {
         send2Client("Save failed: entry", 0);
         close(rs.rdb_fd);
     }
@@ -488,16 +527,17 @@ void cmd_save(int argc, char *argv[]) {
         send2Client("Usage: SAVE", 0);
     }
     char h_buf[10] = "REDIS1.0.0";
-    if ((write(rs.rdb_fd, h_buf, 10) != sizeof(h_buf))) {
+    if ((write(rs.rdb_fd, h_buf, 10) != 10)) {
         send2Client("Save failed: REDIS-version", 0);
         close(rs.rdb_fd);
         return;
     }
     // 遍历所有数据库，保存已有数据
-    for (int i = 0; i < MAX_RDB_NUM; ++i) {
+    for (int i = 0; i < MAX_RDB_NUM && rs.rdb[i].ht->size; ++i) {
         char db_buf[16] = {0};
         snprintf(db_buf, sizeof(db_buf), "DB%d", i);
-        if ((write(rs.rdb_fd, db_buf, strlen(db_buf)) != strlen(db_buf))) {
+        ssize_t len = (ssize_t) strlen(db_buf);
+        if ((write(rs.rdb_fd, db_buf, len) != len)) {
             send2Client("Save failed: DB", 0);
             close(rs.rdb_fd);
             return;
