@@ -5,11 +5,14 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <regex.h>
 
 #define TABLE_SIZE 16
-#define MAX_RDB_NUM 8
-#define PORT 6379
 #define BUFFER_SIZE 1024
+#define REDIS_DEFAULT_RDB_FILENAME "dump.rdb"
+#define REDIS_DEFAULT_DBNUM 8
+#define REDIS_SERVERPORT 6379
+
 
 /* hashentry data structure */
 typedef struct entry {
@@ -42,7 +45,7 @@ typedef struct redisserver {
     struct sockaddr_in address;
     int addrlen;
 
-    redisdb rdb[MAX_RDB_NUM];
+    redisdb rdb[REDIS_DEFAULT_DBNUM];
 } redisserver;
 
 redisserver rs;
@@ -113,7 +116,7 @@ freeHt(hashtable *ht) {
 
 void
 free_server(void) {
-    for (int i = 0; i < MAX_RDB_NUM; ++i) {
+    for (int i = 0; i < REDIS_DEFAULT_DBNUM; ++i) {
         freeHt(rs.rdb[i].ht);
         freeHt(rs.rdb[i].exp);
     }
@@ -198,25 +201,81 @@ activeexpirecicle(void) {
 }
 
 
-/*
- * flag 0 - response error
- * flag 1 - response sucsess
- * flag 2 - response string data
- * for simple string response
- */
-void
-send2Client(char *response, int flag) {
-    char res[BUFFER_SIZE];
-    if (flag == 0) {
-        snprintf(res, BUFFER_SIZE, "-%s\r\n", response);
-    } else if (flag == 1) {
-        snprintf(res, BUFFER_SIZE, "+%s\r\n", response);
-    } else {
-        snprintf(res, BUFFER_SIZE, "$%lu\r\n%s\r\n", strlen(response), response);
+/* ======================= send RESP data process ======================= */
+
+void send_basic(const char *str, int flag) {
+    int len = (int) strlen(str);
+    char *response = (char *) malloc(len + 4); // +4 for -, \r, \n, \0
+    if (!response) {
+        send(rs.new_socket, "-ERR\r\n", 6, 0);
+        return;
     }
-    send(rs.new_socket, res, strlen(res), 0);
+    if (flag) {
+        sprintf(response, "+%s\r\n", str);
+    } else {
+        sprintf(response, "-%s\r\n", str);
+    }
+    send(rs.new_socket, response, strlen(response), 0);
+    free(response);
 }
 
+void send_error(const char *str) {
+    send_basic(str, 0);
+}
+
+void send_ok(const char *str) {
+    send_basic(str, 1);
+}
+
+void send_integer(int num) {
+    char *response = (char *) malloc(24);
+    if (!response) {
+        send(rs.new_socket, "-ERR\r\n", 6, 0);
+        return;
+    }
+    sprintf(response, ":%d\r\n", num);
+    send(rs.new_socket, response, strlen(response), 0);
+    free(response);
+}
+
+void send_bulk_string(const char *str) {
+    int len = (int) strlen(str);
+    if (!len) {
+        send(rs.new_socket, "$-1\r\n", 7, 0);
+        return;
+    }
+    char *response = (char *) malloc(len + 16); // +16 for $, length, \r, \n, \r, \n, \0
+    if (!response) {
+        send(rs.new_socket, "-ERR\r\n", 6, 0);
+        return;
+    }
+    sprintf(response, "$%d\r\n%s\r\n", len, str);
+    send(rs.new_socket, response, strlen(response), 0);
+    free(response);
+}
+
+void send_array(char **elements, int count) {
+    int total_len = 0;
+
+    for (int i = 0; i < count; i++) {
+        total_len += (int) strlen(elements[i]) + 5; // +5 for $, length, \r, \n, \r, \n
+    }
+
+    char *response = (char *) malloc(total_len + 16); // +16 for *, count, \r, \n, \0
+    if (!response) {
+        send(rs.new_socket, "-ERR\r\n", 6, 0);
+        return;
+    }
+    char *ptr = response;
+    ptr += sprintf(ptr, "*%d\r\n", count);
+
+    for (int i = 0; i < count; i++) {
+        int len = (int) strlen(elements[i]);
+        ptr += sprintf(ptr, "$%d\r\n%s\r\n", len, elements[i]);
+    }
+    send(rs.new_socket, response, strlen(response), 0);
+    free(response);
+}
 
 /* ======================= CMD ======================= */
 void cmd_set(int argc, char *argv[]);
@@ -228,6 +287,8 @@ void cmd_exp(int argc, char *argv[]);
 void cmd_ttl(int argc, char *argv[]);
 
 void cmd_save(int argc, char *argv[]);
+
+void cmd_keys(int argc, char *argv[]);
 
 void cmd_select(int argc, char *argv[]);
 
@@ -241,7 +302,8 @@ static struct {
         {"EXPIRE", cmd_exp},
         {"TTL",    cmd_ttl},
         {"SAVE",   cmd_save},
-        {"SELECT", cmd_save},
+        {"KEYS",   cmd_keys},
+        {"SELECT", cmd_select},
 };
 
 /* ======================= REdis Serialization Protocol process ======================= */
@@ -251,24 +313,27 @@ static struct {
  */
 void
 handle_command(char *command) {
+    printf("CMD: %s\n", command);
+
     int argc = 0;
     char *argv[10];
 
     if (command[0] != '*') {
-        send2Client("protocol error", 0);
+        send_error("protocol error");
         return;
     }
     char *ptr = command + 1;
     argc = atoi(ptr);
     if (argc < 1 || argc > 10) {
-        send2Client("invalid number of arguments", 0);
+        send_error("invalid number of arguments");
         return;
     }
 
     char *token = strtok(command, "\r\n");
     int i = 0;
+    token += 4;
     while (token != NULL) {
-        if (*token == '*' || *token == '$') {
+        if (*token == '$') {
             token = strtok(NULL, "\r\n");
             continue;
         }
@@ -277,7 +342,9 @@ handle_command(char *command) {
     }
     argv[i] = NULL;
     if (i != argc) {
-        send2Client("Erro: *", 0);
+        printf("i=%d\n", i);
+        printf("argc=%d\n", argc);
+        send_error("Erro: *");
         return;
     }
 
@@ -296,7 +363,7 @@ handle_command(char *command) {
             return;
         }
     }
-    send2Client("not suport", 0);
+    send_error("not suport");
 }
 
 /* ======================= Pre work ======================= */
@@ -323,7 +390,7 @@ int parseRdbContent(const unsigned char *data, size_t size) {
             offset += value_len;
 
             printf("found: %s-%s\n", key, value);
-            put(cur_ht, key, value);
+            put(rs.rdb[cur_rdb].ht, key, value);
             free(key);
             free(value);
         }
@@ -374,7 +441,7 @@ void recoverRdb(void) {
  */
 void
 serverinit(void) {
-    for (int i = 0; i < MAX_RDB_NUM; ++i) {
+    for (int i = 0; i < REDIS_DEFAULT_DBNUM; ++i) {
         rs.rdb[i].ht = createHt();
         rs.rdb[i].exp = createHt();
     }
@@ -383,7 +450,7 @@ serverinit(void) {
     cur_expht = rs.rdb[cur_rdb].exp;
     rs.connected = 0;
     rs.userdb = 1;
-    rs.rdb_name = "dump.rdb";
+    rs.rdb_name = REDIS_DEFAULT_RDB_FILENAME;
     recoverRdb();
 }
 
@@ -401,7 +468,7 @@ networkinit(void) {
 
     rs.address.sin_family = AF_INET;
     rs.address.sin_addr.s_addr = INADDR_ANY;
-    rs.address.sin_port = htons(PORT);
+    rs.address.sin_port = htons(REDIS_SERVERPORT);
 
     if (bind(rs.server_fd, (struct sockaddr *) &rs.address, sizeof(rs.address)) < 0) {
         perror("bind failed");
@@ -457,48 +524,47 @@ flushAppendOnlyFile(void) {
 
 void cmd_set(int argc, char *argv[]) {
     if (argc != 3) {
-        send2Client("Usage: set 'key' 'value'", 0);
+        send_error("Usage: set 'key' 'value'");
         return;
     }
     put(cur_ht, argv[1], argv[2]);
-    send2Client("OK", 1);
+    send_ok("OK");
 }
 
 void cmd_get(int argc, char *argv[]) {
     if (argc != 2) {
-        send2Client("Usage: get 'key'", 0);
-        return;
+        send_error("Usage: get 'key'");
     }
     char *value = get(cur_ht, argv[1]);
     if (value) {
-        send2Client(value, 2);
+        send_bulk_string(value);
     } else {
-        send2Client("NULL", 0);
+        send_bulk_string("");
     }
 }
 
 void cmd_exp(int argc, char *argv[]) {
     if (argc < 3) {
-        send2Client("Usage: EXPIRE 'key' 'time'", 0);
+        send_error("Usage: EXPIRE 'key' 'time'");
         return;
     }
     if (expire(argv[1], argv[2])) {
-        send2Client("OK", 1);
+        send_ok("OK");
     } else {
-        send2Client("key not exits", 0);
+        send_error("key not exits");
     }
 }
 
 void cmd_ttl(int argc, char *argv[]) {
     if (argc != 2) {
-        send2Client("Usage: TTL 'key'", 0);
+        send_error("Usage: TTL 'key'");
         return;
     }
     char *value = get(cur_expht, argv[1]);
     if (value) {
-        send2Client(value, 1);
+        send_bulk_string(value);
     } else {
-        send2Client("NULL", 0);
+        send_bulk_string("");
     }
 }
 
@@ -511,7 +577,7 @@ void saveStrPair(entry *e) {
     printf("buf: %s\n", buf);
     ssize_t len = (ssize_t) strlen(buf);
     if ((write(rs.rdb_fd, buf, len)) != len) {
-        send2Client("Save failed: entry", 0);
+        send_error("internal error");
         close(rs.rdb_fd);
     }
     free(buf);
@@ -519,26 +585,27 @@ void saveStrPair(entry *e) {
 
 void cmd_save(int argc, char *argv[]) {
     if ((rs.rdb_fd = open(rs.rdb_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)) == -1) {
+        send_error("internal error");
         perror("Unable to open rdb file for writing");
         exit(EXIT_FAILURE);
     }
 
     if (argc != 1 || strcmp(argv[0], "SAVE") != 0) {
-        send2Client("Usage: SAVE", 0);
+        send_error("Usage: SAVE");
     }
     char h_buf[10] = "REDIS1.0.0";
     if ((write(rs.rdb_fd, h_buf, 10) != 10)) {
-        send2Client("Save failed: REDIS-version", 0);
+        send_error("internal error");
         close(rs.rdb_fd);
         return;
     }
     // 遍历所有数据库，保存已有数据
-    for (int i = 0; i < MAX_RDB_NUM && rs.rdb[i].ht->size; ++i) {
+    for (int i = 0; i < REDIS_DEFAULT_DBNUM && rs.rdb[i].ht->size; ++i) {
         char db_buf[16] = {0};
         snprintf(db_buf, sizeof(db_buf), "DB%d", i);
         ssize_t len = (ssize_t) strlen(db_buf);
         if ((write(rs.rdb_fd, db_buf, len) != len)) {
-            send2Client("Save failed: DB", 0);
+            send_error("internal error");
             close(rs.rdb_fd);
             return;
         }
@@ -547,14 +614,61 @@ void cmd_save(int argc, char *argv[]) {
         for (int j = 0; j < TABLE_SIZE; ++j) {
             entry *e = ht->entry[j];
             while (e) {
-                printf("hi %d\n", j);
                 saveStrPair(e);
                 e = e->next;
             }
         }
     }
     close(rs.rdb_fd);
-    send2Client("OK", 1);
+    send_ok("OK");
+}
+
+void escape_regex_specials(const char *pattern, char *buf) {
+    char *p = buf;
+    while (*pattern) {
+//        if (strchr(".*+?^$[](){}|\\", *pattern)) {
+        if (strchr("*", *pattern)) {
+            *p++ = '.';
+        }
+        *p++ = *pattern++;
+    }
+    *p = '\0';
+}
+
+void cmd_keys(int argc, char *argv[]) {
+    if (argc != 2) {
+        send_error("Usage: KEYS [reg]");
+        return;
+    }
+    char buf[256];
+    escape_regex_specials(argv[1], buf);
+    regex_t regex;
+    if (regcomp(&regex, buf, REG_EXTENDED)) {
+        send_error("regex error");
+        return;
+    }
+    char *keys[50];
+    int j = 0;
+    for (int i = 0; i < TABLE_SIZE; ++i) {
+        entry *e = cur_ht->entry[i];
+        while (e) {
+            if (!regexec(&regex, e->key, 0, NULL, 0)) {
+                keys[j++] = strdup(e->key);
+            }
+            e = e->next;
+        }
+    }
+    regfree(&regex);
+    send_array(keys, j);
+}
+
+void cmd_select(int argc, char *argv[]) {
+    if (argc != 2) {
+        send_error("Usage: SELECT [dbnum]");
+        return;
+    }
+    cur_ht = rs.rdb[atoi(argv[1])].ht;
+    send_ok("OK");
 }
 
 int
