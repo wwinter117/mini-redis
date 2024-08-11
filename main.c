@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <regex.h>
+#include <time.h>
 
 #define TABLE_SIZE 16
 #define BUFFER_SIZE 1024
@@ -15,44 +16,47 @@
 
 
 /* hashentry data structure */
-typedef struct entry {
+typedef struct Entry {
     void *key;
     void *value;
-    struct entry *next;
-} entry;
+    struct Entry *next;
+} Entry;
 
-/* hashtable data structure */
-typedef struct hashtable {
-    entry *entry[TABLE_SIZE];
+/* HashTable data structure */
+typedef struct HashTable {
+    Entry *entry[TABLE_SIZE];
     unsigned long size;
-} hashtable;
+} HashTable;
 
-typedef struct redisdb {
-    hashtable *ht;
-    hashtable *exp;
-} redisdb;
+typedef struct RedisDB {
+    HashTable *ht;
+    HashTable *exp;
+} RedisDB;
 
-typedef struct redisserver {
+typedef struct RedisServer {
     int connected;
 
-    int userdb; // 1 - use rdb; 0 - not use rdb
+    int use_rdb; // 1 - use rdb; 0 - not use rdb
     int rdb_fd;
     char *rdb_name;
 
     int server_fd;
     int new_socket;
+    unsigned short port;
 
     struct sockaddr_in address;
     int addrlen;
 
-    redisdb rdb[REDIS_DEFAULT_DBNUM];
-} redisserver;
+    int db_num;
+    RedisDB *rdb;
 
-redisserver rs;
-int cur_rdb;
-hashtable *cur_ht;
-hashtable *cur_expht;
+    int cur_rdb;
 
+    time_t stat_starttime;
+
+} RedisServer;
+
+RedisServer rs;
 
 /* ======================= Hashtable implementation ======================= */
 
@@ -69,11 +73,11 @@ hash(const char *key) {
     return value;
 }
 
-entry *
+Entry *
 createEntry(const char *key, const char *value) {
-    entry *e = malloc(sizeof(entry));
+    Entry *e = malloc(sizeof(Entry));
     if (!e) {
-        perror("malloc failed for entry");
+        perror("malloc failed for Entry");
         exit(EXIT_FAILURE);
     }
     e->key = strdup(key);
@@ -83,17 +87,17 @@ createEntry(const char *key, const char *value) {
 }
 
 void
-freeEntry(entry *e) {
+freeEntry(Entry *e) {
     free(e->key);
     free(e->value);
     free(e);
 }
 
-hashtable *
+HashTable *
 createHt(void) {
-    hashtable *ht = malloc(sizeof(hashtable));
+    HashTable *ht = malloc(sizeof(HashTable));
     if (!ht) {
-        perror("malloc failed for hashtable");
+        perror("malloc failed for HashTable");
         exit(EXIT_FAILURE);
     }
     memset(ht->entry, 0, sizeof(ht->entry));
@@ -102,11 +106,11 @@ createHt(void) {
 }
 
 void
-freeHt(hashtable *ht) {
+freeHt(HashTable *ht) {
     for (int i = 0; i < TABLE_SIZE; ++i) {
-        entry *e = ht->entry[i];
+        Entry *e = ht->entry[i];
         while (e) {
-            entry *t = e;
+            Entry *t = e;
             e = e->next;
             freeEntry(t);
         }
@@ -115,8 +119,8 @@ freeHt(hashtable *ht) {
 }
 
 void
-free_server(void) {
-    for (int i = 0; i < REDIS_DEFAULT_DBNUM; ++i) {
+freeServer(void) {
+    for (int i = 0; i < rs.db_num; ++i) {
         freeHt(rs.rdb[i].ht);
         freeHt(rs.rdb[i].exp);
     }
@@ -125,9 +129,9 @@ free_server(void) {
 
 /* ======================= For debug ======================= */
 void
-printht(hashtable *ht) {
+printHt(HashTable *ht) {
     for (int i = 0; i < TABLE_SIZE; ++i) {
-        entry *e = ht->entry[i];
+        Entry *e = ht->entry[i];
         if (e) {
             printf("%d\t: ", i);
             while (e) {
@@ -147,16 +151,16 @@ printht(hashtable *ht) {
 /* ======================= Data process ======================= */
 
 void
-put(hashtable *ht, const char *key, const char *value) {
+put(HashTable *ht, const char *key, const char *value) {
     unsigned int slot = hash(key);
-    entry *e = ht->entry[slot];
+    Entry *e = ht->entry[slot];
     if (e == NULL) {
         ht->entry[slot] = createEntry(key, value);
         ht->size++;
         return;
     }
 
-    entry *pre = NULL;
+    Entry *pre = NULL;
     while (e) {
         if (strcmp(e->key, key) == 0) {
             free(e->value);
@@ -171,9 +175,9 @@ put(hashtable *ht, const char *key, const char *value) {
 }
 
 char *
-get(hashtable *ht, const char *key) {
+get(HashTable *ht, const char *key) {
     unsigned int slot = hash(key);
-    entry *e = ht->entry[slot];
+    Entry *e = ht->entry[slot];
     while (e) {
         if (strcmp(e->key, key) == 0) {
             return e->value;
@@ -185,10 +189,10 @@ get(hashtable *ht, const char *key) {
 
 int
 expire(char *key, char *time) {
-    if (get(cur_ht, key) == NULL) {
+    if (get(rs.rdb[rs.cur_rdb].ht, key) == NULL) {
         return 0;
     }
-    put(cur_expht, key, time);
+    put(rs.rdb[rs.cur_rdb].exp, key, time);
     return 1;
 }
 
@@ -203,7 +207,8 @@ activeexpirecicle(void) {
 
 /* ======================= send RESP data process ======================= */
 
-void send_basic(const char *str, int flag) {
+void
+send_basic(const char *str, int flag) {
     int len = (int) strlen(str);
     char *response = (char *) malloc(len + 4); // +4 for -, \r, \n, \0
     if (!response) {
@@ -219,15 +224,18 @@ void send_basic(const char *str, int flag) {
     free(response);
 }
 
-void send_error(const char *str) {
+void
+send_error(const char *str) {
     send_basic(str, 0);
 }
 
-void send_ok(const char *str) {
+void
+send_ok(const char *str) {
     send_basic(str, 1);
 }
 
-void send_integer(int num) {
+void
+send_integer(int num) {
     char *response = (char *) malloc(24);
     if (!response) {
         send(rs.new_socket, "-ERR\r\n", 6, 0);
@@ -238,13 +246,14 @@ void send_integer(int num) {
     free(response);
 }
 
-void send_bulk_string(const char *str) {
-    int len = (int) strlen(str);
-    if (!len) {
+void
+send_bulk_string(const char *str) {
+    if (!str) {
         send(rs.new_socket, "$-1\r\n", 7, 0);
         return;
     }
-    char *response = (char *) malloc(len + 16); // +16 for $, length, \r, \n, \r, \n, \0
+    int len = (int) strlen(str);
+    char *response = malloc(len + 16);
     if (!response) {
         send(rs.new_socket, "-ERR\r\n", 6, 0);
         return;
@@ -254,7 +263,9 @@ void send_bulk_string(const char *str) {
     free(response);
 }
 
-void send_array(char **elements, int count) {
+
+void
+send_array(char **elements, int count) {
     int total_len = 0;
 
     for (int i = 0; i < count; i++) {
@@ -368,17 +379,186 @@ handle_command(char *command) {
 
 /* ======================= Pre work ======================= */
 
+
+
+/* ======================= implimentations ======================= */
+
+void
+cmd_set(int argc, char *argv[]) {
+    if (argc != 3) {
+        send_error("Usage: set 'key' 'value'");
+        return;
+    }
+    put(rs.rdb[rs.cur_rdb].ht, argv[1], argv[2]);
+    send_ok("OK");
+}
+
+void
+cmd_get(int argc, char *argv[]) {
+    if (argc != 2) {
+        send_error("Usage: get 'key'");
+    }
+    char *value = get(rs.rdb[rs.cur_rdb].ht, argv[1]);
+    if (value) {
+        send_bulk_string(value);
+    } else {
+        send_bulk_string("");
+    }
+}
+
+void
+cmd_exp(int argc, char *argv[]) {
+    if (argc < 3) {
+        send_error("Usage: EXPIRE 'key' 'time'");
+        return;
+    }
+    if (expire(argv[1], argv[2])) {
+        send_ok("OK");
+    } else {
+        send_error("key not exits");
+    }
+}
+
+void
+cmd_ttl(int argc, char *argv[]) {
+    if (argc != 2) {
+        send_error("Usage: TTL 'key'");
+        return;
+    }
+    char *value = get(rs.rdb[rs.cur_rdb].exp, argv[1]);
+    if (value) {
+        send_bulk_string(value);
+    } else {
+        send_bulk_string("");
+    }
+}
+
+void
+saveStrPair(Entry *e) {
+    char *k = e->key;
+    char *v = e->value;
+    size_t buf_size = strlen(k) + strlen(v) + 16;
+    char *buf = malloc(buf_size);
+    snprintf(buf, buf_size, "%d%s%d%s", (int) strlen(k), k, (int) strlen(v), v);
+    printf("buf: %s\n", buf);
+    ssize_t len = (ssize_t) strlen(buf);
+    if ((write(rs.rdb_fd, buf, len)) != len) {
+        send_error("internal error");
+        close(rs.rdb_fd);
+    }
+    free(buf);
+}
+
+void
+cmd_save(int argc, char *argv[]) {
+    if (argc != 1 || strcmp(argv[0], "SAVE") != 0) {
+        send_error("Usage: SAVE");
+        return;
+    }
+
+    if ((rs.rdb_fd = open(rs.rdb_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)) == -1) {
+        send_error("internal error");
+        perror("Unable to open rdb file for writing");
+        return;
+    }
+
+    char h_buf[10] = "REDIS1.0.0";
+    if ((write(rs.rdb_fd, h_buf, 10) != 10)) {
+        send_error("internal error");
+        close(rs.rdb_fd);
+        return;
+    }
+    // 遍历所有数据库，保存已有数据
+    for (int i = 0; i < rs.db_num && rs.rdb[i].ht->size; ++i) {
+        char db_buf[16] = {0};
+        snprintf(db_buf, sizeof(db_buf), "DB%d", i);
+        ssize_t len = (ssize_t) strlen(db_buf);
+        if ((write(rs.rdb_fd, db_buf, len) != len)) {
+            send_error("internal error");
+            close(rs.rdb_fd);
+            return;
+        }
+        HashTable *ht = rs.rdb[i].ht;
+        printHt(ht);
+        for (int j = 0; j < TABLE_SIZE; ++j) {
+            Entry *e = ht->entry[j];
+            while (e) {
+                saveStrPair(e);
+                e = e->next;
+            }
+        }
+    }
+    close(rs.rdb_fd);
+    send_ok("OK");
+}
+
+void
+escape_regex_specials(const char *pattern, char *buf) {
+    char *p = buf;
+    while (*pattern) {
+//        if (strchr(".*+?^$[](){}|\\", *pattern)) {
+        if (strchr("*", *pattern)) {
+            *p++ = '.';
+        }
+        *p++ = *pattern++;
+    }
+    *p = '\0';
+}
+
+void
+cmd_keys(int argc, char *argv[]) {
+    if (argc != 2) {
+        send_error("Usage: KEYS [reg]");
+        return;
+    }
+    char buf[256];
+    escape_regex_specials(argv[1], buf);
+    regex_t regex;
+    if (regcomp(&regex, buf, REG_EXTENDED)) {
+        send_error("regex error");
+        return;
+    }
+    char *keys[50];
+    int j = 0;
+    for (int i = 0; i < TABLE_SIZE; ++i) {
+        Entry *e = rs.rdb[rs.cur_rdb].ht->entry[i];
+        while (e) {
+            if (!regexec(&regex, e->key, 0, NULL, 0)) {
+                keys[j++] = strdup(e->key);
+            }
+            e = e->next;
+        }
+    }
+    regfree(&regex);
+    send_array(keys, j);
+    for (int i = 0; i < j; i++) {
+        free(keys[i]);
+    }
+}
+
+void
+cmd_select(int argc, char *argv[]) {
+    if (argc != 2) {
+        send_error("Usage: SELECT [dbnum]");
+        return;
+    }
+    rs.cur_rdb = atoi(argv[1]);
+    send_ok("OK");
+}
+
+
 /*
  * 解析数据库和键值对
  */
-int parseRdbContent(const unsigned char *data, size_t size) {
+int
+parseRdbContent(const unsigned char *data, size_t size) {
     size_t offset = 10;  // Skip "REDIS" and version
     printf("[Mini-Redis] start recovery\n");
 
     while (offset < size) {
         if (strncmp((const char *) (data + offset), "DB", 2) == 0) {
-            cur_rdb = data[offset + 2] - '0';
-            printf("[Mini-Redis] found database: %d\n", cur_rdb);
+            rs.cur_rdb = data[offset + 2] - '0';
+            printf("[Mini-Redis] found database: %d\n", rs.cur_rdb);
             offset += 3;
         } else {
             int key_len = data[offset++] - '0';
@@ -390,16 +570,18 @@ int parseRdbContent(const unsigned char *data, size_t size) {
             offset += value_len;
 
             printf("found: %s-%s\n", key, value);
-            put(rs.rdb[cur_rdb].ht, key, value);
+            put(rs.rdb[rs.cur_rdb].ht, key, value);
             free(key);
             free(value);
         }
     }
+    rs.cur_rdb = 0;
     printf("[Mini-Redis] done\n");
     return 1;
 }
 
-void recoverRdb(void) {
+void
+recoverRdb(void) {
     FILE *file = fopen(rs.rdb_name, "rb");
     if (!file) {
         fprintf(stderr, "Failed to open rdb file\n");
@@ -434,50 +616,6 @@ void recoverRdb(void) {
     // 解析 RDB 键值对
     parseRdbContent(data, size);
     free(data);
-}
-
-/*
- * initail rdb hastable and rdb expire hashtable
- */
-void
-serverinit(void) {
-    for (int i = 0; i < REDIS_DEFAULT_DBNUM; ++i) {
-        rs.rdb[i].ht = createHt();
-        rs.rdb[i].exp = createHt();
-    }
-    cur_rdb = 0;
-    cur_ht = rs.rdb[cur_rdb].ht;
-    cur_expht = rs.rdb[cur_rdb].exp;
-    rs.connected = 0;
-    rs.userdb = 1;
-    rs.rdb_name = REDIS_DEFAULT_RDB_FILENAME;
-    recoverRdb();
-}
-
-/*
- * bind socket and lesten on it
- */
-void
-networkinit(void) {
-    rs.addrlen = sizeof(rs.address);
-
-    if ((rs.server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-
-    rs.address.sin_family = AF_INET;
-    rs.address.sin_addr.s_addr = INADDR_ANY;
-    rs.address.sin_port = htons(REDIS_SERVERPORT);
-
-    if (bind(rs.server_fd, (struct sockaddr *) &rs.address, sizeof(rs.address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-    if (listen(rs.server_fd, 3) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
 }
 
 void
@@ -519,168 +657,106 @@ flushAppendOnlyFile(void) {
 
 }
 
+/*
+ * initail server
+ */
+void
+serverinit(void) {
+    rs.db_num = REDIS_DEFAULT_DBNUM;
+    rs.cur_rdb = 0;
+    rs.connected = 0;
+    rs.use_rdb = 1;
+    rs.rdb_name = REDIS_DEFAULT_RDB_FILENAME;
+    rs.addrlen = sizeof(rs.address);
+    rs.port = REDIS_SERVERPORT;
 
-/* ======================= implimentations ======================= */
-
-void cmd_set(int argc, char *argv[]) {
-    if (argc != 3) {
-        send_error("Usage: set 'key' 'value'");
-        return;
-    }
-    put(cur_ht, argv[1], argv[2]);
-    send_ok("OK");
+    rs.stat_starttime = time(NULL);
 }
 
-void cmd_get(int argc, char *argv[]) {
-    if (argc != 2) {
-        send_error("Usage: get 'key'");
-    }
-    char *value = get(cur_ht, argv[1]);
-    if (value) {
-        send_bulk_string(value);
-    } else {
-        send_bulk_string("");
-    }
-}
+void
+networkInit(void) {
+    rs.address.sin_family = AF_INET;
+    rs.address.sin_addr.s_addr = INADDR_ANY;
+    rs.address.sin_port = htons(rs.port);
 
-void cmd_exp(int argc, char *argv[]) {
-    if (argc < 3) {
-        send_error("Usage: EXPIRE 'key' 'time'");
-        return;
-    }
-    if (expire(argv[1], argv[2])) {
-        send_ok("OK");
-    } else {
-        send_error("key not exits");
-    }
-}
-
-void cmd_ttl(int argc, char *argv[]) {
-    if (argc != 2) {
-        send_error("Usage: TTL 'key'");
-        return;
-    }
-    char *value = get(cur_expht, argv[1]);
-    if (value) {
-        send_bulk_string(value);
-    } else {
-        send_bulk_string("");
-    }
-}
-
-void saveStrPair(entry *e) {
-    char *k = e->key;
-    char *v = e->value;
-    size_t buf_size = strlen(k) + strlen(v) + 16;
-    char *buf = malloc(buf_size);
-    snprintf(buf, buf_size, "%d%s%d%s", (int) strlen(k), k, (int) strlen(v), v);
-    printf("buf: %s\n", buf);
-    ssize_t len = (ssize_t) strlen(buf);
-    if ((write(rs.rdb_fd, buf, len)) != len) {
-        send_error("internal error");
-        close(rs.rdb_fd);
-    }
-    free(buf);
-}
-
-void cmd_save(int argc, char *argv[]) {
-    if ((rs.rdb_fd = open(rs.rdb_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR)) == -1) {
-        send_error("internal error");
-        perror("Unable to open rdb file for writing");
+    if ((rs.server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
         exit(EXIT_FAILURE);
     }
 
-    if (argc != 1 || strcmp(argv[0], "SAVE") != 0) {
-        send_error("Usage: SAVE");
+    if (bind(rs.server_fd, (struct sockaddr *) &rs.address, sizeof(rs.address)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
     }
-    char h_buf[10] = "REDIS1.0.0";
-    if ((write(rs.rdb_fd, h_buf, 10) != 10)) {
-        send_error("internal error");
-        close(rs.rdb_fd);
-        return;
+    if (listen(rs.server_fd, 3) < 0) {
+        perror("listen");
+        exit(EXIT_FAILURE);
     }
-    // 遍历所有数据库，保存已有数据
-    for (int i = 0; i < REDIS_DEFAULT_DBNUM && rs.rdb[i].ht->size; ++i) {
-        char db_buf[16] = {0};
-        snprintf(db_buf, sizeof(db_buf), "DB%d", i);
-        ssize_t len = (ssize_t) strlen(db_buf);
-        if ((write(rs.rdb_fd, db_buf, len) != len)) {
-            send_error("internal error");
-            close(rs.rdb_fd);
-            return;
-        }
-        hashtable *ht = rs.rdb[i].ht;
-        printht(ht);
-        for (int j = 0; j < TABLE_SIZE; ++j) {
-            entry *e = ht->entry[j];
-            while (e) {
-                saveStrPair(e);
-                e = e->next;
-            }
-        }
-    }
-    close(rs.rdb_fd);
-    send_ok("OK");
 }
 
-void escape_regex_specials(const char *pattern, char *buf) {
-    char *p = buf;
-    while (*pattern) {
-//        if (strchr(".*+?^$[](){}|\\", *pattern)) {
-        if (strchr("*", *pattern)) {
-            *p++ = '.';
-        }
-        *p++ = *pattern++;
+void
+dsInit(void) {
+    rs.rdb = malloc(rs.db_num * sizeof(RedisDB));
+    if (!rs.rdb) {
+        fprintf(stderr, "malloc failed for rdb array\n");
+        exit(EXIT_FAILURE);
     }
-    *p = '\0';
+    for (int i = 0; i < rs.db_num; ++i) {
+        rs.rdb[i].ht = createHt();
+        rs.rdb[i].exp = createHt();
+    }
 }
 
-void cmd_keys(int argc, char *argv[]) {
-    if (argc != 2) {
-        send_error("Usage: KEYS [reg]");
+void
+loadServerConfig(char *config) {
+    FILE *f;
+    if ((f = fopen(config, "r")) == NULL) {
+        fprintf(stderr, "can not open config file\n");
         return;
     }
-    char buf[256];
-    escape_regex_specials(argv[1], buf);
-    regex_t regex;
-    if (regcomp(&regex, buf, REG_EXTENDED)) {
-        send_error("regex error");
-        return;
-    }
-    char *keys[50];
-    int j = 0;
-    for (int i = 0; i < TABLE_SIZE; ++i) {
-        entry *e = cur_ht->entry[i];
-        while (e) {
-            if (!regexec(&regex, e->key, 0, NULL, 0)) {
-                keys[j++] = strdup(e->key);
-            }
-            e = e->next;
+    char buf[1024];
+    while (fgets(buf, 1024, f)) {
+        char *key = strtok(buf, " \t\n");
+        char *value = strtok(NULL, " \t\n");
+
+        if (!key || !value) {
+            continue;
+        }
+
+        printf("key: %s | value: %s\n", key, value);
+
+        if (strcmp(key, "port") == 0) {
+            rs.port = (unsigned short) atoi(value);
+        } else if (strcmp(key, "databases") == 0) {
+            rs.db_num = atoi(value);
+        } else if (strcmp(key, "dbfilename") == 0) {
+            rs.rdb_name = strdup(value);
+        } else {
+            printf("Unknown configuration key: %s\n", key);
         }
     }
-    regfree(&regex);
-    send_array(keys, j);
+    fclose(f);
 }
 
-void cmd_select(int argc, char *argv[]) {
-    if (argc != 2) {
-        send_error("Usage: SELECT [dbnum]");
-        return;
-    }
-    cur_ht = rs.rdb[atoi(argv[1])].ht;
-    send_ok("OK");
-}
 
 int
 main(int argc, char *argv[]) {
-    if (argc != 1) {
-        fprintf(stderr, "Usage: mini-redis-server\n");
+    if (argc > 2) {
+        fprintf(stderr, "Usage: mini-redis-server [conf]\n");
         exit(EXIT_FAILURE);
     }
 
     printf("[Mini-Redis] is starting...\n");
     serverinit();
-    networkinit();
+
+    if (argc == 2) {
+        loadServerConfig(argv[1]);
+    }
+    dsInit();
+    recoverRdb();
+    rs.stat_starttime = time(NULL);
+    networkInit();
+
     printf("[Mini-Redis] started\n");
 
     while (1) {
@@ -693,6 +769,6 @@ main(int argc, char *argv[]) {
             flushAppendOnlyFile();
         }
     }
-    free_server();
+    freeServer();
     return 0;
 }
